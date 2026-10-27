@@ -1,16 +1,3 @@
-"""
-Bite by Night: Discord thread -> X, run by GitHub Actions.
-Free, no server, no credit card, no X API.
-
-Every few minutes GitHub runs this script. It asks Discord for new messages in
-the RoAPI thread. For each new bot/webhook message it posts:
-
-  🚨UPDATE: The Bite by Night Testing Game has been updated at {date}, {time} EST.
-
-The post is made through a real browser that uses the saved X login.
-The ID of the last message handled is kept in last_id.txt so nothing is
-tweeted twice.
-"""
 import json
 import os
 import subprocess
@@ -82,7 +69,7 @@ class Poster:
         except ImportError:
             subprocess.run([sys.executable, "-m", "pip", "install", "playwright"], check=True)
         subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"],
+            [sys.executable, "-m", "playwright", "install", "--with-deps", "chrome"],
             check=True,
         )
         from playwright.sync_api import sync_playwright
@@ -90,7 +77,7 @@ class Poster:
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             f.write(os.environ["X_STATE_JSON"])
         self.pw = sync_playwright().start()
-        self.browser = self.pw.chromium.launch(headless=True)
+        self.browser = self.pw.chromium.launch(channel="chrome", headless=True)
         self.ctx = self.browser.new_context(
             storage_state=STATE_FILE, viewport={"width": 1280, "height": 900}
         )
