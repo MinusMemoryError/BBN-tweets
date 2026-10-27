@@ -77,16 +77,21 @@ class Poster:
             import playwright  # noqa: F401
         except ImportError:
             subprocess.run([sys.executable, "-m", "pip", "install", "playwright"], check=True)
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "--with-deps", "chrome"],
-            check=True,
-        )
         from playwright.sync_api import sync_playwright
 
         with open(STATE_FILE, "w", encoding="utf-8") as f:
             f.write(os.environ["X_STATE_JSON"])
         self.pw = sync_playwright().start()
-        self.browser = self.pw.chromium.launch(channel="chrome", headless=True)
+        try:
+            # GitHub's machines already come with Google Chrome installed
+            self.browser = self.pw.chromium.launch(channel="chrome", headless=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"Chrome not found ({e}). Installing it...")
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "--with-deps", "chrome"],
+                check=True,
+            )
+            self.browser = self.pw.chromium.launch(channel="chrome", headless=True)
         self.ctx = self.browser.new_context(
             storage_state=STATE_FILE, viewport={"width": 1280, "height": 900}
         )
@@ -108,6 +113,7 @@ class Poster:
                     page.keyboard.press("Enter")
                 if line:
                     page.keyboard.insert_text(line)  # insert_text handles emoji reliably
+            page.keyboard.insert_text(" ")  # a final space closes X's hashtag suggestion box
             page.wait_for_timeout(1000)
 
             if image_path:
@@ -117,7 +123,11 @@ class Poster:
 
             button = page.locator('[data-testid="tweetButton"]')
             button.wait_for(timeout=10_000)
-            button.click(timeout=60_000)  # waits until the button is enabled
+            try:
+                button.click(timeout=15_000)
+            except Exception:  # noqa: BLE001
+                # something invisible is covering the button, so click it from inside the page
+                button.evaluate("el => el.click()")
             page.wait_for_timeout(4000)  # let the post go through
         except Exception:
             page.screenshot(path="post_failed.png")
