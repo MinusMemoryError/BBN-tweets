@@ -11,6 +11,18 @@ THREAD_ID = os.environ["THREAD_ID"].strip()
 DRY_RUN = os.getenv("DRY_RUN", "1") == "1"  # 1 = only print, 0 = really tweet
 ALLOW_HUMANS = os.getenv("ALLOW_HUMANS", "0") == "1"  # 1 = also react to people (for testing)
 FIXED_EST = os.getenv("FIXED_EST", "0") == "1"  # 1 = always UTC-5 labeled EST
+
+# How grouping works:
+# - Each run looks only at messages that are NEW since the last tweet (last_id.txt).
+# - New updates from the same day (Eastern time) become ONE tweet ("updated 5 times...").
+# - Updates from different days are never mixed: each day gets its own tweet.
+# - Once tweeted, an update is never counted again by a later run.
+#
+# Optional: wait until RoAPI has been quiet this many minutes before tweeting today's updates.
+# 0 = tweet at the next check, no waiting.
+QUIET_MINUTES = int(os.getenv("QUIET_MINUTES", "0"))
+MAX_WAIT_MINUTES = int(os.getenv("MAX_WAIT_MINUTES", "120"))  # never hold updates longer than this
+
 LAST_ID_FILE = "last_id.txt"
 STATE_FILE = "x_state.json"  # written at runtime from the X_STATE_JSON secret
 HASHTAGS = "#BiteByNight #ROBLOX"
@@ -29,20 +41,51 @@ def discord_get(path):
         return json.load(resp)
 
 
-def build_tweet(sent_utc):
+def to_local(sent_utc):
     if FIXED_EST:
-        sent = sent_utc.astimezone(timezone(timedelta(hours=-5)))
-        label = "EST"
-    else:
-        sent = sent_utc.astimezone(ZoneInfo("America/New_York"))
-        label = sent.tzname()  # EST or EDT, whichever is correct on that date
+        return sent_utc.astimezone(timezone(timedelta(hours=-5))), "EST"
+    local = sent_utc.astimezone(ZoneInfo("America/New_York"))
+    return local, local.tzname()  # EST or EDT, whichever is correct on that date
 
-    date_str = f"{sent.strftime('%B')} {sent.day}, {sent.year}"
-    hour = sent.hour % 12 or 12
-    time_str = f"{hour}:{sent.minute:02d} {'AM' if sent.hour < 12 else 'PM'}"
+
+def when_text(local, label):
+    """Example: October 27, 2026, 3:45 PM EDT"""
+    hour = local.hour % 12 or 12
+    ampm = "AM" if local.hour < 12 else "PM"
+    return f"{local.strftime('%B')} {local.day}, {local.year}, {hour}:{local.minute:02d} {ampm} {label}"
+
+
+def clock_text(local, label):
+    """Example: 1 PM EDT (or 1:05 PM EDT when the minutes are not 00)"""
+    hour = local.hour % 12 or 12
+    ampm = "AM" if local.hour < 12 else "PM"
+    clock = f"{hour} {ampm}" if local.minute == 0 else f"{hour}:{local.minute:02d} {ampm}"
+    return f"{clock} {label}"
+
+
+def build_tweet(sent_utc):
+    local, label = to_local(sent_utc)
     return (
         f"🚨UPDATE: The Bite by Night Testing Game has been updated at "
-        f"{date_str}, {time_str} {label}.\n\n{HASHTAGS}"
+        f"{when_text(local, label)}.\n\n{HASHTAGS}"
+    )
+
+
+def build_group_tweet(times_utc):
+    """Several updates from the SAME day."""
+    times_utc = sorted(times_utc)
+    n = len(times_utc)
+    first, first_label = to_local(times_utc[0])
+    last, last_label = to_local(times_utc[-1])
+
+    if first.strftime("%Y%m%d%H%M") == last.strftime("%Y%m%d%H%M"):
+        span = f"at {when_text(first, first_label)}"
+    else:
+        span = f"throughout {clock_text(first, first_label)} to {clock_text(last, last_label)}"
+
+    return (
+        f"🚨UPDATE: The Bite by Night Testing Game has been updated {n} times "
+        f"{span}.\n\n{HASHTAGS}"
     )
 
 
@@ -62,6 +105,33 @@ def is_target(message):
 def save_last_id(message_id):
     with open(LAST_ID_FILE, "w", encoding="utf-8") as f:
         f.write(str(message_id))
+
+
+def split_by_day(messages):
+    """Cuts the (oldest-first) message list into one group per Eastern-time day."""
+    groups = []
+    for m in messages:
+        day = to_local(datetime.fromisoformat(m["timestamp"]))[0].date()
+        if groups and groups[-1][0] == day:
+            groups[-1][1].append(m)
+        else:
+            groups.append((day, [m]))
+    return groups
+
+
+def should_wait(times):
+    if QUIET_MINUTES <= 0 or ALLOW_HUMANS:
+        return False
+    now = datetime.now(timezone.utc)
+    quiet_for = (now - times[-1]).total_seconds() / 60
+    held_for = (now - times[0]).total_seconds() / 60
+    if quiet_for < QUIET_MINUTES and held_for < MAX_WAIT_MINUTES:
+        print(
+            f"{len(times)} update(s) found. Waiting until RoAPI has been quiet "
+            f"for {QUIET_MINUTES} minutes (quiet for {quiet_for:.0f} so far)."
+        )
+        return True
+    return False
 
 
 class Poster:
@@ -103,8 +173,17 @@ class Poster:
         page = self.ctx.new_page()
         try:
             page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
-            box = page.locator('[data-testid="tweetTextarea_0"]')
-            box.wait_for(timeout=30_000)  # fails here if the login expired
+
+            # X can show TWO post boxes (the pop-up and the home page one behind it).
+            # Wait for any box, then work ONLY inside the pop-up if there is one.
+            page.locator('[data-testid="tweetTextarea_0"]').first.wait_for(timeout=30_000)
+            page.wait_for_timeout(2000)
+            dialog = page.locator('[role="dialog"]').filter(
+                has=page.locator('[data-testid="tweetTextarea_0"]')
+            )
+            scope = dialog.first if dialog.count() > 0 else page
+
+            box = scope.locator('[data-testid="tweetTextarea_0"]').first
             box.click()
 
             # type the text line by line; Enter makes a new line
@@ -117,11 +196,13 @@ class Poster:
             page.wait_for_timeout(1000)
 
             if image_path:
-                page.locator('input[data-testid="fileInput"]').first.set_input_files(image_path)
-                page.locator('[data-testid="attachments"]').wait_for(timeout=60_000)
+                scope.locator('input[data-testid="fileInput"]').first.set_input_files(image_path)
+                scope.locator('[data-testid="attachments"]').first.wait_for(timeout=60_000)
                 page.wait_for_timeout(3000)  # let the image finish uploading
 
-            button = page.locator('[data-testid="tweetButton"]')
+            button = scope.locator(
+                '[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'
+            ).first
             button.wait_for(timeout=10_000)
             try:
                 button.click(timeout=15_000)
@@ -154,30 +235,48 @@ def main():
         print("First run: remembered the newest message. Nothing tweeted.")
         return
 
-    messages = discord_get(f"/channels/{THREAD_ID}/messages?after={last_id}&limit=50")
+    # Only messages AFTER the bookmark: anything already tweeted is never seen again.
+    messages = discord_get(f"/channels/{THREAD_ID}/messages?after={last_id}&limit=100")
     messages.sort(key=lambda m: int(m["id"]))
     if not messages:
         print("No new messages.")
         return
 
+    groups = split_by_day(messages)
     image = find_image()
+    if image is None:
+        print("WARNING: no update.png found in the repository, posting without an image.")
+
     poster = Poster()
     try:
-        for m in messages:
-            if is_target(m):
-                text = build_tweet(datetime.fromisoformat(m["timestamp"]))
-                if image is None:
-                    print("WARNING: no update.png found in the repository, posting without an image.")
-                if DRY_RUN:
-                    print("DRY RUN - would tweet:\n" + text)
-                    print(f"DRY RUN - image: {image}")
-                else:
-                    poster.post(text, image)
-                    print("Posted:\n" + text)
-            save_last_id(m["id"])  # only moves forward after success
+        for index, (day, group) in enumerate(groups):
+            group_last_id = group[-1]["id"]
+            targets = [m for m in group if is_target(m)]
+            if not targets:
+                save_last_id(group_last_id)
+                print(f"{day}: new messages, but none from RoAPI. Skipped.")
+                continue
+
+            times = sorted(datetime.fromisoformat(m["timestamp"]) for m in targets)
+
+            # only the newest day can still be "in progress"; older days are finished
+            if index == len(groups) - 1 and should_wait(times):
+                break
+
+            text = build_tweet(times[0]) if len(times) == 1 else build_group_tweet(times)
+
+            if DRY_RUN:
+                print(f"DRY RUN - would tweet ({day}):\n{text}\nDRY RUN - image: {image}")
+            else:
+                poster.post(text, image)
+                print(f"Posted ({day}):\n{text}")
+
+            # bookmark moves forward right after each tweet, so these updates
+            # can never be counted again by the next run
+            save_last_id(group_last_id)
     except Exception as e:  # noqa: BLE001
         print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)  # this message is retried on the next run
+        sys.exit(1)  # whatever was not tweeted yet is retried on the next run
     finally:
         poster.close()
 
