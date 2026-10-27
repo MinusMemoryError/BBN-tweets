@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]
@@ -23,10 +23,21 @@ FIXED_EST = os.getenv("FIXED_EST", "0") == "1"  # 1 = always UTC-5 labeled EST
 QUIET_MINUTES = int(os.getenv("QUIET_MINUTES", "0"))
 MAX_WAIT_MINUTES = int(os.getenv("MAX_WAIT_MINUTES", "120"))  # never hold updates longer than this
 
+# The maintenance line that goes between the update text and the hashtags.
+# It depends on the DATE OF THE UPDATE (Eastern time). The newest line whose start date
+# has been reached is used, and the last one stays forever. Before the first date: no line.
+MAINTENANCE_LINES = [
+    (date(2026, 11, 1), "Maintenance estimated to end this month."),
+    (date(2026, 11, 15), "Maintenance estimated to end at Late November."),
+    (date(2026, 11, 25), "Maintenance estimated to end at December."),
+]
+
 LAST_ID_FILE = "last_id.txt"
 STATE_FILE = "x_state.json"  # written at runtime from the X_STATE_JSON secret
 HASHTAGS = "#BiteByNight #ROBLOX"
-IMAGE_NAMES = ("update.png", "update.jpg", "update.jpeg", "update.webp")
+# Images attached to every tweet, in this order. Each one may be .png, .jpg, .jpeg or .webp.
+IMAGE_BASENAMES = ("update", "update2")
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp")
 
 
 def discord_get(path):
@@ -63,12 +74,31 @@ def clock_text(local, label):
     return f"{clock} {label}"
 
 
+def maintenance_line(day):
+    line = None
+    for start, text in MAINTENANCE_LINES:
+        if day >= start:
+            line = text
+    return line
+
+
+def assemble(main_text, day):
+    """update text + (maintenance line) + hashtags, with a blank line between each part"""
+    parts = [main_text]
+    line = maintenance_line(day)
+    if line:
+        parts.append(line)
+    parts.append(HASHTAGS)
+    return "\n\n".join(parts)
+
+
 def build_tweet(sent_utc):
     local, label = to_local(sent_utc)
-    return (
+    main_text = (
         f"🚨UPDATE: The Bite by Night Testing Game has been updated at "
-        f"{when_text(local, label)}.\n\n{HASHTAGS}"
+        f"{when_text(local, label)}."
     )
+    return assemble(main_text, local.date())
 
 
 def build_group_tweet(times_utc):
@@ -83,17 +113,19 @@ def build_group_tweet(times_utc):
     else:
         span = f"throughout {clock_text(first, first_label)} to {clock_text(last, last_label)}"
 
-    return (
-        f"🚨UPDATE: The Bite by Night Testing Game has been updated {n} times "
-        f"{span}.\n\n{HASHTAGS}"
-    )
+    main_text = f"🚨UPDATE: The Bite by Night Testing Game has been updated {n} times {span}."
+    return assemble(main_text, first.date())
 
 
-def find_image():
-    for name in IMAGE_NAMES:
-        if os.path.exists(name):
-            return name
-    return None
+def find_images():
+    found = []
+    for base in IMAGE_BASENAMES:
+        path = next((base + ext for ext in IMAGE_EXTENSIONS if os.path.exists(base + ext)), None)
+        if path:
+            found.append(path)
+        else:
+            print(f"WARNING: no {base}.png (or .jpg/.jpeg/.webp) found in the repository.")
+    return found
 
 
 def is_target(message):
@@ -166,7 +198,7 @@ class Poster:
             storage_state=STATE_FILE, viewport={"width": 1280, "height": 900}
         )
 
-    def post(self, text, image_path=None):
+    def post(self, text, image_paths=None):
         if self.ctx is None:
             self._start()
 
@@ -186,7 +218,7 @@ class Poster:
             box = scope.locator('[data-testid="tweetTextarea_0"]').first
             box.click()
 
-            # type the text line by line; Enter makes a new line
+            # type the text line by line; Enter makes a new line (empty lines = blank lines)
             for i, line in enumerate(text.split("\n")):
                 if i > 0:
                     page.keyboard.press("Enter")
@@ -195,10 +227,16 @@ class Poster:
             page.keyboard.insert_text(" ")  # a final space closes X's hashtag suggestion box
             page.wait_for_timeout(1000)
 
-            if image_path:
-                scope.locator('input[data-testid="fileInput"]').first.set_input_files(image_path)
+            if image_paths:
+                file_input = scope.locator('input[data-testid="fileInput"]').first
+                try:
+                    file_input.set_input_files(image_paths)  # all images at once
+                except Exception:  # noqa: BLE001
+                    for path in image_paths:  # fallback: one image at a time
+                        file_input.set_input_files(path)
+                        page.wait_for_timeout(3000)
                 scope.locator('[data-testid="attachments"]').first.wait_for(timeout=60_000)
-                page.wait_for_timeout(3000)  # let the image finish uploading
+                page.wait_for_timeout(3000 + 3000 * len(image_paths))  # let the uploads finish
 
             button = scope.locator(
                 '[data-testid="tweetButton"], [data-testid="tweetButtonInline"]'
@@ -243,9 +281,7 @@ def main():
         return
 
     groups = split_by_day(messages)
-    image = find_image()
-    if image is None:
-        print("WARNING: no update.png found in the repository, posting without an image.")
+    images = find_images()
 
     poster = Poster()
     try:
@@ -266,9 +302,9 @@ def main():
             text = build_tweet(times[0]) if len(times) == 1 else build_group_tweet(times)
 
             if DRY_RUN:
-                print(f"DRY RUN - would tweet ({day}):\n{text}\nDRY RUN - image: {image}")
+                print(f"DRY RUN - would tweet ({day}):\n{text}\nDRY RUN - images: {images}")
             else:
-                poster.post(text, image)
+                poster.post(text, images)
                 print(f"Posted ({day}):\n{text}")
 
             # bookmark moves forward right after each tweet, so these updates
