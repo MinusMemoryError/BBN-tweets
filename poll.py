@@ -13,6 +13,8 @@ ALLOW_HUMANS = os.getenv("ALLOW_HUMANS", "0") == "1"  # 1 = also react to people
 FIXED_EST = os.getenv("FIXED_EST", "0") == "1"  # 1 = always UTC-5 labeled EST
 LAST_ID_FILE = "last_id.txt"
 STATE_FILE = "x_state.json"  # written at runtime from the X_STATE_JSON secret
+HASHTAGS = "#BiteByNight #ROBLOX"
+IMAGE_NAMES = ("update.png", "update.jpg", "update.jpeg", "update.webp")
 
 
 def discord_get(path):
@@ -40,8 +42,15 @@ def build_tweet(sent_utc):
     time_str = f"{hour}:{sent.minute:02d} {'AM' if sent.hour < 12 else 'PM'}"
     return (
         f"🚨UPDATE: The Bite by Night Testing Game has been updated at "
-        f"{date_str}, {time_str} {label}."
+        f"{date_str}, {time_str} {label}.\n\n{HASHTAGS}"
     )
+
+
+def find_image():
+    for name in IMAGE_NAMES:
+        if os.path.exists(name):
+            return name
+    return None
 
 
 def is_target(message):
@@ -82,10 +91,9 @@ class Poster:
             storage_state=STATE_FILE, viewport={"width": 1280, "height": 900}
         )
 
-    def post(self, text):
+    def post(self, text, image_path=None):
         if self.ctx is None:
             self._start()
-        from playwright.sync_api import TimeoutError as PlaywrightTimeout
 
         page = self.ctx.new_page()
         try:
@@ -93,13 +101,25 @@ class Poster:
             box = page.locator('[data-testid="tweetTextarea_0"]')
             box.wait_for(timeout=30_000)  # fails here if the login expired
             box.click()
-            page.keyboard.insert_text(text)  # insert_text handles emoji reliably
+
+            # type the text line by line; Enter makes a new line
+            for i, line in enumerate(text.split("\n")):
+                if i > 0:
+                    page.keyboard.press("Enter")
+                if line:
+                    page.keyboard.insert_text(line)  # insert_text handles emoji reliably
             page.wait_for_timeout(1000)
+
+            if image_path:
+                page.locator('input[data-testid="fileInput"]').first.set_input_files(image_path)
+                page.locator('[data-testid="attachments"]').wait_for(timeout=60_000)
+                page.wait_for_timeout(3000)  # let the image finish uploading
+
             button = page.locator('[data-testid="tweetButton"]')
             button.wait_for(timeout=10_000)
-            button.click()
+            button.click(timeout=60_000)  # waits until the button is enabled
             page.wait_for_timeout(4000)  # let the post go through
-        except PlaywrightTimeout:
+        except Exception:
             page.screenshot(path="post_failed.png")
             raise
         finally:
@@ -130,15 +150,19 @@ def main():
         print("No new messages.")
         return
 
+    image = find_image()
     poster = Poster()
     try:
         for m in messages:
             if is_target(m):
                 text = build_tweet(datetime.fromisoformat(m["timestamp"]))
+                if image is None:
+                    print("WARNING: no update.png found in the repository, posting without an image.")
                 if DRY_RUN:
                     print("DRY RUN - would tweet:\n" + text)
+                    print(f"DRY RUN - image: {image}")
                 else:
-                    poster.post(text)
+                    poster.post(text, image)
                     print("Posted:\n" + text)
             save_last_id(m["id"])  # only moves forward after success
     except Exception as e:  # noqa: BLE001
