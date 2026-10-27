@@ -28,7 +28,7 @@ jobs:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           THREAD_ID: ${{ secrets.THREAD_ID }}
           X_STATE_JSON: ${{ secrets.X_STATE_JSON }}
-          DRY_RUN: "1"        # change to "0" to really tweet
+          DRY_RUN: "0"        # change to "0" to really tweet
           ALLOW_HUMANS: "1"   # "1" = also react to people (only for testing)
           FIXED_EST: "0"      # "1" = always label the time EST
         run: python poll.py
