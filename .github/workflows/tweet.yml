@@ -1,0 +1,50 @@
+name: Tweet on update
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may run it a bit late)
+  workflow_dispatch:         # lets you start it by hand from the Actions tab
+
+permissions:
+  contents: write
+
+concurrency:
+  group: tweet
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check Discord and tweet
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          THREAD_ID: ${{ secrets.THREAD_ID }}
+          X_STATE_JSON: ${{ secrets.X_STATE_JSON }}
+          DRY_RUN: "1"        # change to "0" to really tweet
+          ALLOW_HUMANS: "0"   # "1" = also react to people (only for testing)
+          FIXED_EST: "0"      # "1" = always label the time EST
+        run: python poll.py
+
+      - name: Save progress
+        if: always()
+        run: |
+          git config user.name "update-bot"
+          git config user.email "update-bot@users.noreply.github.com"
+          git add last_id.txt
+          git diff --cached --quiet || (git commit -m "update last message id" && git push)
+
+      - name: Keep screenshot if posting failed
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: post-failed
+          path: post_failed.png
+          if-no-files-found: ignore
