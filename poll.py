@@ -83,10 +83,10 @@ class Poster:
         )
 
     def post(self, text):
-        from playwright.sync_api import TimeoutError as PlaywrightTimeout
-
         if self.ctx is None:
             self._start()
+        from playwright.sync_api import TimeoutError as PlaywrightTimeout
+
         page = self.ctx.new_page()
         try:
             page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
