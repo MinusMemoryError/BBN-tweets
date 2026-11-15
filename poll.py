@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import urllib.request
 from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -22,6 +23,10 @@ FIXED_EST = os.getenv("FIXED_EST", "0") == "1"  # 1 = always UTC-5 labeled EST
 # 0 = tweet at the next check, no waiting.
 QUIET_MINUTES = int(os.getenv("QUIET_MINUTES", "0"))
 MAX_WAIT_MINUTES = int(os.getenv("MAX_WAIT_MINUTES", "120"))  # never hold updates longer than this
+
+# After a FAILED post the bot stops visiting X for this many minutes (so it does not
+# hammer X every 5 minutes, which can get the account flagged). Updates are not lost.
+FAILURE_COOLDOWN_MINUTES = int(os.getenv("FAILURE_COOLDOWN_MINUTES", "30"))
 
 # The maintenance line that goes between the update text and the hashtags.
 # It depends on the DATE OF THE UPDATE (Eastern time). The newest line whose start date
@@ -134,9 +139,20 @@ def is_target(message):
     return ALLOW_HUMANS
 
 
-def save_last_id(message_id):
+def read_state():
+    """last_id.txt: line 1 = bookmark, line 2 (optional) = do not visit X before this time."""
+    if not os.path.exists(LAST_ID_FILE):
+        return "", 0
+    with open(LAST_ID_FILE, encoding="utf-8") as f:
+        parts = f.read().split()
+    last_id = parts[0] if parts else ""
+    cooldown_until = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    return last_id, cooldown_until
+
+
+def save_state(last_id, cooldown_until=0):
     with open(LAST_ID_FILE, "w", encoding="utf-8") as f:
-        f.write(str(message_id))
+        f.write(str(last_id) + (f"\n{int(cooldown_until)}" if cooldown_until else ""))
 
 
 def split_by_day(messages):
@@ -164,6 +180,25 @@ def should_wait(times):
         )
         return True
     return False
+
+
+def log_response(response):
+    """Prints the HTTP status code X answers with, so a failure can be understood."""
+    try:
+        if response.request.resource_type == "document":
+            print(f"X answered {response.status} for {response.url}")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def describe_page(page):
+    """Prints what the browser was looking at when something went wrong."""
+    try:
+        print(f"Page at the time of the failure: {page.url}")
+        print(f"Page title: {page.title()!r}")
+        print(f"Page text starts with: {page.inner_text('body')[:300]!r}")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 class Poster:
@@ -198,18 +233,30 @@ class Poster:
             storage_state=STATE_FILE, viewport={"width": 1280, "height": 900}
         )
 
+    def _open_composer(self, page):
+        box = page.locator('[data-testid="tweetTextarea_0"]').first
+        try:
+            page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
+            box.wait_for(timeout=30_000)  # fails here if the login expired
+        except Exception as first_error:  # noqa: BLE001
+            print(f"Opening the composer directly failed: {first_error}")
+            print("Trying the other way: home page, then the Post button...")
+            page.goto("https://x.com/home", wait_until="domcontentloaded")
+            page.locator('[data-testid="SideNav_NewTweet_Button"]').first.click(timeout=30_000)
+            box.wait_for(timeout=30_000)
+
     def post(self, text, image_paths=None):
         if self.ctx is None:
             self._start()
 
         page = self.ctx.new_page()
+        page.on("response", log_response)
         try:
-            page.goto("https://x.com/compose/post", wait_until="domcontentloaded")
+            self._open_composer(page)
+            page.wait_for_timeout(2000)
 
             # X can show TWO post boxes (the pop-up and the home page one behind it).
-            # Wait for any box, then work ONLY inside the pop-up if there is one.
-            page.locator('[data-testid="tweetTextarea_0"]').first.wait_for(timeout=30_000)
-            page.wait_for_timeout(2000)
+            # Work ONLY inside the pop-up if there is one.
             dialog = page.locator('[role="dialog"]').filter(
                 has=page.locator('[data-testid="tweetTextarea_0"]')
             )
@@ -249,6 +296,7 @@ class Poster:
                 button.evaluate("el => el.click()")
             page.wait_for_timeout(4000)  # let the post go through
         except Exception:
+            describe_page(page)
             page.screenshot(path="post_failed.png")
             raise
         finally:
@@ -262,15 +310,17 @@ class Poster:
 
 
 def main():
-    last_id = ""
-    if os.path.exists(LAST_ID_FILE):
-        with open(LAST_ID_FILE, encoding="utf-8") as f:
-            last_id = f.read().strip()
+    last_id, cooldown_until = read_state()
 
     if not last_id:
         latest = discord_get(f"/channels/{THREAD_ID}/messages?limit=1")
-        save_last_id(latest[0]["id"] if latest else "0")
+        save_state(latest[0]["id"] if latest else "0")
         print("First run: remembered the newest message. Nothing tweeted.")
+        return
+
+    if cooldown_until > time.time():
+        minutes = (cooldown_until - time.time()) / 60
+        print(f"Cooling down after a failed post. Not visiting X for another {minutes:.0f} minutes.")
         return
 
     # Only messages AFTER the bookmark: anything already tweeted is never seen again.
@@ -282,6 +332,7 @@ def main():
 
     groups = split_by_day(messages)
     images = find_images()
+    bookmark = last_id
 
     poster = Poster()
     try:
@@ -289,7 +340,8 @@ def main():
             group_last_id = group[-1]["id"]
             targets = [m for m in group if is_target(m)]
             if not targets:
-                save_last_id(group_last_id)
+                save_state(group_last_id)
+                bookmark = group_last_id
                 print(f"{day}: new messages, but none from RoAPI. Skipped.")
                 continue
 
@@ -309,10 +361,14 @@ def main():
 
             # bookmark moves forward right after each tweet, so these updates
             # can never be counted again by the next run
-            save_last_id(group_last_id)
+            save_state(group_last_id)
+            bookmark = group_last_id
     except Exception as e:  # noqa: BLE001
         print(f"ERROR: {e}", file=sys.stderr)
-        sys.exit(1)  # whatever was not tweeted yet is retried on the next run
+        # keep the bookmark where it is and pause visits to X for a while
+        save_state(bookmark, time.time() + FAILURE_COOLDOWN_MINUTES * 60)
+        print(f"Will not visit X again for {FAILURE_COOLDOWN_MINUTES} minutes. Updates are kept.")
+        sys.exit(1)
     finally:
         poster.close()
 
